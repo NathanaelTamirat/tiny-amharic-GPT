@@ -1,25 +1,29 @@
 import torch 
 import torch.nn as nn
 import torch.nn .functional as F
+from torch.optim.lr_scheduler import CosineAnnealingLR
 torch.manual_seed(1337)
 
 # hyperparameters
-batch_size = 32 # how many independent sequences will we process in parallel?
-block_size = 8 # what is the maximum context length for predictions?
-max_iters = 5000
-eval_interval = 300
-learning_rate = 1e-3
+batch_size = 64 # how many independent sequences will we process in parallel?
+block_size = 256 # what is the maximum context length for predictions?
+max_iters = 10000
+eval_interval = 500
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-n_embed=32
+n_embed=512
+n_head=8
+n_layer=8
+dropout=0.1
 
-with open('data/input.txt', 'r', encoding='utf-8') as f:
+with open('final_cleaned_amaharic_corpus.txt', 'r', encoding='utf-8') as f:
     text = f.read()
-
+print(device)
 #unique chars in the text
 chars = sorted(list(set(text)))
 vocab_size = len(chars)
-
+print(vocab_size)
 # mapping from chars to integers
 stoi = { ch:i for i,ch in enumerate(chars) }
 itos = { i:ch for i,ch in enumerate(chars) }
@@ -65,6 +69,7 @@ class Head(nn.Module):
         self.query=nn.Linear(n_embed,head_size,bias=False)
         self.value=nn.Linear(n_embed,head_size,bias=False)
         self.register_buffer("tril",torch.tril(torch.ones(block_size,block_size)))
+        self.dropout=nn.Dropout(dropout) #regualrize it to overcome the overfitting
 
     def forward(self,x):
         # input of size (batch, time-step, channels)
@@ -74,40 +79,43 @@ class Head(nn.Module):
         v=self.value(x) # (B,T,hs)
  
         wei=q@k.transpose(-2,-1) * k.shape[-1]**0.5# scaling   # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-        '''decoder block '''
-        ''' cant compute the future'''
+        '''  decoder block '''
+        '''  cant compute the future'''
         wei=wei.masked_fill(self.tril[:T,:T]==0,float('-inf')) # -> (B, T, T)
         wei=F.softmax(wei,dim=-1) # -> (B, T, T)
         out=wei@v  # (B,T,T) @ (B,T,hs)------>(B,T,hs)
         # output of size (batch, time-step, head size)
         return out
 
+""" multpile head of self attention(in parallel)"""
 class MultiHeadAttention(nn.Module):
 
     def __init__(self,num_heads,head_size):
         super().__init__()
         self.heads=nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj=nn.Linear(n_embed,n_embed)
+        self.proj=nn.Linear(head_size*num_heads,n_embed)
+        self.dropout=nn.Dropout(dropout)
 
     def forward(self,x):
         out= torch.cat([h(x) for h in self.heads],dim=-1)
-        out= self.proj(out)
+        out= self.dropout(self.proj(out))
         return out
     
-    
-"""think on the data individually""" 
+"""think on the data individually(each token)"""
 class FeedForward(nn.Module):
     
     def __init__(self,n_embed):
         super().__init__()
         self.net=nn.Sequential(
-            nn.Linear(n_embed,n_embed),
-            nn.ReLU(),
-            nn.Linear(n_embed,n_embed)
+            nn.Linear(n_embed,4*n_embed),
+            nn.GELU(),   # nn.ReLU(),
+            nn.Linear(4* n_embed,n_embed),
+            nn.Dropout(dropout)
         )
     def forward(self,x):
         return self.net(x)
     
+""" transformer block"""
 class Block(nn.Module):
 
     def __init__(self,n_embed,n_head):
@@ -115,6 +123,9 @@ class Block(nn.Module):
         head_size=n_embed//n_head
         self.sa=MultiHeadAttention(n_head,head_size)
         self.ffwd=FeedForward(n_embed)
+        self.ln1=nn.LayerNorm(n_embed) #normalize the layer
+        self.ln2=nn.LayerNorm(n_embed)
+
     
     """ residual connection is to add the original input (or a modified version 
     of it) to the output of a deeper layer. This helps mitigate the degradation 
@@ -124,30 +135,40 @@ class Block(nn.Module):
     """
 
     def forward(self,x):
-        x=x+self.sa(x)
-        x=x+self.ffwd(x)
+        x=x+self.sa(self.ln1(x)) #normalize the layer before self attention
+        x=x+self.ffwd((self.ln2(x)))  #normalize the layer before self attention 
         return x
 
 
 '''simple bigram model'''
-class BigramLanguageModel(nn.Module):
+class GPTLM(nn.Module):
 
     def __init__(self):
         super().__init__()
         self.token_embed_table=nn.Embedding(vocab_size,n_embed) # each token directly reads off the logits for the next token from a lookup table
         self.position_embedding_table=nn.Embedding(block_size,n_embed)
-        self.sa_head=MultiHeadAttention(4,n_embed//4)
-        self.ffwd=FeedForward(n_embed)
+        self.blocks = nn.Sequential(*[Block(n_embed, n_head=n_head) for _ in range(n_layer)])  # 6 layer of block
+        self.ln_f=nn.LayerNorm(n_embed) # the final layer norm
         self.lm_head=nn.Linear(n_embed,vocab_size) # (32,65)
         
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self,module):
+        if isinstance(module,nn.Linear):
+            torch.nn.init.normal_(module.weight,mean=0.0,std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module,nn.Embedding):
+            torch.nn.init.normal_(module.weight,mean=0.0,std=0.2)      
+
     def forward(self,idx,targets=None):
         B,T=idx.shape
         #id and and target are integer tensor
         token_embed=self.token_embed_table(idx)  # B,T,n_embed  ->  (batch,time(block),n_embed)
         post_embed=self.position_embedding_table(torch.arange(T,device=device))
-        x=token_embed+post_embed
-        x=self.sa_head(x)
-        x=self.ffwd(x)
+        x = self.ln_f(token_embed + post_embed) #x=token_embed+post_embed  # Added layer norm after embedding 
+        x=self.blocks(x)
         logits=self.lm_head(x)  # B,T,vocab_size 
 
         if targets is None:
@@ -168,15 +189,20 @@ class BigramLanguageModel(nn.Module):
             probs=F.softmax(logits,dim=-1) #get prob
             idx_next=torch.multinomial(probs,num_samples=1)
             idx=torch.cat((idx,idx_next), dim=1)
-            #print(idx)
         return idx
 
-model = BigramLanguageModel()
+model = GPTLM()
 m = model.to(device)  #directly move the table to the gpu
+print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
+# #optimizer
+# optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-#optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+# Optimizer with weight decay
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+
+# Learning rate scheduler
+scheduler = CosineAnnealingLR(optimizer, T_max=max_iters)
 
 
 for iter in range(max_iters):
@@ -186,12 +212,22 @@ for iter in range(max_iters):
 
     # sample a batch of data
     xb, yb = get_batch('train')
-    # loss
+   
+   # loss
     logits, loss = model(xb, yb)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
+    
+    # Gradient clipping
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    
     optimizer.step()
+    scheduler.step()
 
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+# print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+# open('final.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+
+with open('final.txt', 'w', encoding='utf-8') as file:
+    file.write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
