@@ -95,7 +95,7 @@ class MultiHeadAttention(nn.Module):
         return out
     
     
-"""think on the data individually"""
+"""think on the data individually""" 
 class FeedForward(nn.Module):
     
     def __init__(self,n_embed):
