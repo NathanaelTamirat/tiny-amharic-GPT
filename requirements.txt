@@ -1,0 +1,2 @@
+Python=>3.8
+pytorch=>11.8  #for cuda
